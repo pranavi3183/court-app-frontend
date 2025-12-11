@@ -4,8 +4,12 @@ import { fetchCoaches } from "../../api/coaches";
 import { createBooking } from "../../api/bookings";
 import CourtsList from "../courts/CourtsList";
 import CoachesList from "../coaches/CoachesList";
+import { fetchEquipmentAvailability } from "../../api/equipment";
 
 export default function BookingForm({ onSuccess }) {
+  const [availability, setAvailability] = useState({ racket: null, shoes: null });
+  const [availLoading, setAvailLoading] = useState(false);
+
   const [courts, setCourts] = useState([]);
   const [coaches, setCoaches] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -24,6 +28,7 @@ export default function BookingForm({ onSuccess }) {
     shoes: 0,
   });
 
+  // Load initial courts & coaches
   useEffect(() => {
     async function load() {
       try {
@@ -43,14 +48,75 @@ export default function BookingForm({ onSuccess }) {
     load();
   }, []);
 
+  // Fetch availability for selected court + time window (debounced)
+  useEffect(() => {
+    // small debounce so we don't hammer backend while user types
+    const t = setTimeout(() => {
+      loadAvailability(selectedCourtId, form.date, form.startTime, form.endTime);
+    }, 350);
+
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedCourtId, form.date, form.startTime, form.endTime]);
+
+  async function loadAvailability(courtId, date, startTime, endTime) {
+    // reset if any required param missing
+    if (!courtId || !date || !startTime || !endTime) {
+      setAvailability({ racket: null, shoes: null });
+      return;
+    }
+
+    // build ISO strings (frontend uses local -> toISOString())
+    let startISO, endISO;
+    try {
+      startISO = new Date(`${date}T${startTime}`).toISOString();
+      endISO = new Date(`${date}T${endTime}`).toISOString();
+    } catch (err) {
+      setAvailability({ racket: null, shoes: null });
+      return;
+    }
+
+    setAvailLoading(true);
+    try {
+      const data = await fetchEquipmentAvailability(courtId, startISO, endISO);
+      // backend returns available as { racket: n, shoes: m }
+      const a = data && data.available ? data.available : { racket: null, shoes: null };
+      setAvailability({ racket: a.racket ?? null, shoes: a.shoes ?? null });
+
+      // If current inputs exceed newly available counts, clamp them
+      setForm((prev) => {
+        const next = { ...prev };
+        if (a.racket != null && Number(prev.rackets) > a.racket) next.rackets = a.racket;
+        if (a.shoes != null && Number(prev.shoes) > a.shoes) next.shoes = a.shoes;
+        return next;
+      });
+    } catch (err) {
+      console.error("availability fetch error", err);
+      setAvailability({ racket: null, shoes: null });
+    } finally {
+      setAvailLoading(false);
+    }
+  }
+
   const handleChange = (e) => {
     const { name, value } = e.target;
 
-    if (name === "rackets" || name === "shoes") {
-      setForm((prev) => ({ ...prev, [name]: Number(value) }));
-    } else {
-      setForm((prev) => ({ ...prev, [name]: value }));
+    if (name === "rackets") {
+      // clamp using availability if present
+      const num = Number(value || 0);
+      const max = availability.racket == null ? Infinity : Number(availability.racket);
+      setForm((prev) => ({ ...prev, rackets: Math.max(0, Math.min(num, max)) }));
+      return;
     }
+
+    if (name === "shoes") {
+      const num = Number(value || 0);
+      const max = availability.shoes == null ? Infinity : Number(availability.shoes);
+      setForm((prev) => ({ ...prev, shoes: Math.max(0, Math.min(num, max)) }));
+      return;
+    }
+
+    setForm((prev) => ({ ...prev, [name]: value }));
   };
 
   const handleSubmit = async (e) => {
@@ -79,6 +145,7 @@ export default function BookingForm({ onSuccess }) {
         endTime: endISO,
       };
 
+      // final availability & booking is enforced on backend transactionally
       const result = await createBooking(payload);
       onSuccess?.(result);
 
@@ -95,7 +162,9 @@ export default function BookingForm({ onSuccess }) {
       // keep selected court for convenience
     } catch (err) {
       console.error(err);
-      setError(err.message || "Booking failed, please try again.");
+      // If backend returned an object or text, prefer readable message
+      const message = err?.message || (err?.error ? err.error : "Booking failed, please try again.");
+      setError(message);
     } finally {
       setSubmitting(false);
     }
@@ -191,11 +260,16 @@ export default function BookingForm({ onSuccess }) {
           <label className="block text-sm font-medium text-slate-700 mb-1">
             Equipment
           </label>
+
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <span className="block text-xs text-slate-600 mb-1">
-                Rackets
-              </span>
+              <label className="block text-xs text-slate-600 mb-1">
+                Rackets{" "}
+                <span className="text-[11px] text-slate-500">
+                  {availLoading ? "(checking…)" : availability.racket == null ? "" : `(available: ${availability.racket})`}
+                </span>
+              </label>
+
               <input
                 type="number"
                 min="0"
@@ -203,10 +277,19 @@ export default function BookingForm({ onSuccess }) {
                 value={form.rackets}
                 onChange={handleChange}
                 className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                // set max attr for UI where supported
+                max={availability.racket == null ? undefined : availability.racket}
               />
             </div>
+
             <div>
-              <span className="block text-xs text-slate-600 mb-1">Shoes</span>
+              <label className="block text-xs text-slate-600 mb-1">
+                Shoes{" "}
+                <span className="text-[11px] text-slate-500">
+                  {availLoading ? "(checking…)" : availability.shoes == null ? "" : `(available: ${availability.shoes})`}
+                </span>
+              </label>
+
               <input
                 type="number"
                 min="0"
@@ -214,11 +297,13 @@ export default function BookingForm({ onSuccess }) {
                 value={form.shoes}
                 onChange={handleChange}
                 className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                max={availability.shoes == null ? undefined : availability.shoes}
               />
             </div>
           </div>
+
           <p className="mt-1 text-[11px] text-slate-500">
-            Equipment availability is validated by the backend.
+            Equipment availability is validated by the backend. Frontend shows live availability to help you choose.
           </p>
         </div>
 
